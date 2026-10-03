@@ -18,6 +18,7 @@ import {
   DELIVERY_OTP_READY_STATUSES
 } from './orderNotificationService.js';
 import { escrowRelease, markEscrowBookingStarted, paisaToMaticWei, resolveExpectedDepositAmount } from '../escrow.js';
+import { acquireLockOrFallback } from '../../lib/lockFallback.js';
 import { DomainError } from './domainError.js';
 import { measureExecution } from '../../core/performanceMetrics.js';
 import { broadcastOrderMilestone } from '../../sockets/tracker.js';
@@ -54,6 +55,17 @@ export class OrderMilestoneService {
         throw new DomainError(403, {
           error: 'Access Denied: You are not assigned to this order.'
         });
+
+      const cancelLockKey = `lock:order:cancel:${order.id}`;
+      const cancelLock = await acquireLockOrFallback(cancelLockKey, 30000);
+      if (!cancelLock.ok) {
+        throw new DomainError(409, { error: 'Order is currently being cancelled or modified. Cannot update milestone.' });
+      }
+
+      try {
+        if (['cancelled', 'cancelling', 'disputed'].includes(order.status)) {
+          throw new DomainError(409, { error: `Cannot update milestone: order has been ${order.status}.` });
+        }
 
       const timeline = await this.orderTimelineService.getOrderTimeline(order.order_display_id);
 
@@ -103,6 +115,7 @@ export class OrderMilestoneService {
         {
           p_order_id: orderId,
           p_status: status,
+          p_not_statuses: ['cancelled', 'cancelling', 'disputed'],
           p_event_type: 'ORDER_UPDATED',
           p_payload_extra: { milestone, order_display_id: order.order_display_id },
         },
@@ -111,9 +124,9 @@ export class OrderMilestoneService {
 
       if (updateErr || !updatedRows || updatedRows.length === 0) {
         await this.orderTimelineService.resetMilestone(order.order_display_id, milestone);
-        throw new DomainError(500, {
+        throw new DomainError(409, {
           error: 'Failed to update order.',
-          details: updateErr?.message ?? 'Order status guard rejected the milestone update.'
+          details: updateErr?.message ?? 'Order status guard rejected the milestone update (order may be cancelled).'
         });
       }
 
@@ -158,7 +171,10 @@ export class OrderMilestoneService {
       broadcastOrderMilestone(order.order_display_id, milestone, status);
 
       return { order: updatedOrder, milestone, status };
-    });
+    } finally {
+      await cancelLock.release();
+    }
+  });
   }
 
   async verifyDelivery({ orderId, otp, driverId }, userClient) {
