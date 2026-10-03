@@ -791,14 +791,19 @@ export class OrderLifecycleService {
         if (currentOrderErr) throw new DomainError(500, { error: 'Failed to fetch order.', details: currentOrderErr.message });
         if (!currentOrder) throw new DomainError(404, { error: 'Order not found.' });
 
-        // Idempotency check: if already cancelled (or cancelled with this key), return cached result
-        if (currentOrder.status === 'cancelled' || (idempotencyKey && currentOrder.cancellation_idempotency_key === idempotencyKey)) {
+        const requiresRefund = ['funding', 'funded', 'refund_pending', 'refund_failed'].includes(currentOrder.escrow_status);
+
+        // Idempotency check: return cached 200 only when no refund is required or escrow refund has completed.
+        // If escrow_status is refund_pending or refund_failed, continue to the retry/reconciliation flow.
+        const isCancelledOrIdempotent = currentOrder.status === 'cancelled'
+          || Boolean(idempotencyKey && currentOrder.cancellation_idempotency_key === idempotencyKey);
+
+        if (isCancelledOrIdempotent && (!requiresRefund || currentOrder.escrow_status === 'refunded')) {
           await this.revokeTrackingTokensForOrder(currentOrder.order_display_id);
-          const isRefunded = currentOrder.escrow_status === 'refunded';
           return {
             status: 200,
             body: {
-              message: isRefunded ? 'Order was already cancelled and refunded.' : 'Order was already cancelled.',
+              message: currentOrder.escrow_status === 'refunded' ? 'Order was already cancelled and refunded.' : 'Order was already cancelled.',
               cancellation_fee: currentOrder.cancellation_fee ?? 0,
               order: currentOrder,
             },
@@ -821,7 +826,6 @@ export class OrderLifecycleService {
           throw new DomainError(409, { error: 'Cannot cancel: the shipment has already been picked up and is in transit.' });
         }
 
-        const requiresRefund = ['funding', 'funded', 'refund_pending', 'refund_failed'].includes(currentOrder.escrow_status);
         const penaltyBps = currentOrder.status === 'truck_assigned'
           ? 1000
           : ['arrived_pickup'].includes(currentOrder.status)
@@ -842,7 +846,9 @@ export class OrderLifecycleService {
             {
               p_order_id: currentOrder.id,
               p_status: 'cancelled',
-              p_not_statuses: ['picked_up', 'en_route_dropoff', 'in_transit', 'arriving', 'arrived_dropoff', 'delivered', 'payment_released', 'cancelled'],
+              p_not_statuses: currentOrder.status === 'cancelled'
+                ? ['delivered', 'payment_released']
+                : ['picked_up', 'en_route_dropoff', 'in_transit', 'arriving', 'arrived_dropoff', 'delivered', 'payment_released'],
               p_cancellation_reason: reason ?? currentOrder.cancellation_reason,
               p_cancellation_fee: cancellationFee,
               p_escrow_status: 'refund_pending',

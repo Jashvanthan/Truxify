@@ -7,12 +7,29 @@ vi.mock('../../src/middleware/auth.js', () => ({
   verifyAuthToken: vi.fn().mockResolvedValue({ id: 'mock-user' }),
 }));
 
+vi.mock('../../src/services/escrow.js', async (importOriginal) => {
+  const actual = await importOriginal();
+  return {
+    ...actual,
+    submitEscrowRefund: vi.fn(),
+    submitEscrowCancelWithPenalty: vi.fn(),
+    confirmEscrowRefund: vi.fn(),
+  };
+});
+
+vi.mock('../../src/lib/lockFallback.js', () => ({
+  acquireLockOrFallback: vi.fn(() => Promise.resolve({ ok: true, release: vi.fn() })),
+}));
+
 import { cancelOrder as cancelOrderController } from '../../src/controllers/orderController.js';
 import { OrderLifecycleService } from '../../src/services/order/orderLifecycleService.js';
 import { OrderMilestoneService } from '../../src/services/order/orderMilestoneService.js';
-import { formatIdempotencyKeyBytes32 } from '../../src/services/escrow.js';
-import * as escrowModule from '../../src/services/escrow.js';
-import * as lockModule from '../../src/lib/lockFallback.js';
+import {
+  formatIdempotencyKeyBytes32,
+  submitEscrowCancelWithPenalty,
+  submitEscrowRefund,
+} from '../../src/services/escrow.js';
+import { acquireLockOrFallback } from '../../src/lib/lockFallback.js';
 
 describe('Order Cancellation Idempotency & Concurrency Tests (#11242)', () => {
   describe('formatIdempotencyKeyBytes32 helper', () => {
@@ -161,7 +178,7 @@ describe('Order Cancellation Idempotency & Concurrency Tests (#11242)', () => {
         .mockResolvedValueOnce({ data: [{ ...assignedOrder, status: 'cancelled', escrow_status: 'refund_pending' }], error: null })
         .mockResolvedValueOnce({ data: [{ ...assignedOrder, status: 'cancelled', escrow_status: 'refunded' }], error: null });
 
-      const cancelWithPenaltySpy = vi.spyOn(escrowModule, 'submitEscrowCancelWithPenalty').mockResolvedValue({
+      vi.mocked(submitEscrowCancelWithPenalty).mockResolvedValueOnce({
         txHash: '0xrefundtxhash',
         waitForConfirmation: vi.fn().mockResolvedValue({ hash: '0xrefundtxhash' }),
       });
@@ -169,7 +186,7 @@ describe('Order Cancellation Idempotency & Concurrency Tests (#11242)', () => {
       const result = await service.cancelOrder('ord-1', 'cust-1', 'driver too slow', undefined, 'idemp-escrow-key');
 
       expect(result.status).toBe(200);
-      expect(cancelWithPenaltySpy).toHaveBeenCalledWith(
+      expect(submitEscrowCancelWithPenalty).toHaveBeenCalledWith(
         'ORD-1',
         100000000000000000n, // 10% penalty
         'idemp-escrow-key'
@@ -180,7 +197,30 @@ describe('Order Cancellation Idempotency & Concurrency Tests (#11242)', () => {
           cancellation_idempotency_key: 'idemp-escrow-key',
         })
       );
-      cancelWithPenaltySpy.mockRestore();
+    });
+
+    it('retries refund reconciliation when order is cancelled but escrow_status is refund_failed', async () => {
+      const failedRefundOrder = {
+        ...baseOrder,
+        status: 'cancelled',
+        escrow_status: 'refund_failed',
+        escrow_amount_wei: '1000000000000000000',
+        cancellation_idempotency_key: 'retry-idem-key',
+      };
+      orderRepository.findOrderByAnyId.mockResolvedValue({ data: failedRefundOrder, error: null });
+      orderRepository.executeRpc
+        .mockResolvedValueOnce({ data: [{ ...failedRefundOrder, escrow_status: 'refund_pending' }], error: null })
+        .mockResolvedValueOnce({ data: [{ ...failedRefundOrder, escrow_status: 'refunded' }], error: null });
+
+      vi.mocked(submitEscrowRefund).mockResolvedValueOnce({
+        txHash: '0xretryrefundtx',
+        waitForConfirmation: vi.fn().mockResolvedValue({ hash: '0xretryrefundtx' }),
+      });
+
+      const result = await service.cancelOrder('ord-1', 'cust-1', 'retry cancel', undefined, 'retry-idem-key');
+
+      expect(result.status).toBe(200);
+      expect(submitEscrowRefund).toHaveBeenCalledWith('ORD-1', 'retry-idem-key');
     });
 
     it('rejects cancellation when order is already picked_up / in transit', async () => {
@@ -200,7 +240,7 @@ describe('Order Cancellation Idempotency & Concurrency Tests (#11242)', () => {
 
     it('fails with 409 when cancellation lock cannot be acquired due to active contention', async () => {
       orderRepository.findOrderByAnyId.mockResolvedValue({ data: baseOrder, error: null });
-      const lockSpy = vi.spyOn(lockModule, 'acquireLockOrFallback').mockResolvedValueOnce({
+      vi.mocked(acquireLockOrFallback).mockResolvedValueOnce({
         ok: false,
         release: vi.fn(),
       });
@@ -211,7 +251,6 @@ describe('Order Cancellation Idempotency & Concurrency Tests (#11242)', () => {
         status: 409,
         payload: { error: 'Cancellation is currently being processed. Please try again later.' },
       });
-      lockSpy.mockRestore();
     });
   });
 
@@ -257,13 +296,32 @@ describe('Order Cancellation Idempotency & Concurrency Tests (#11242)', () => {
       });
     });
 
+    it('rejects milestone update if order commits cancellation between initial check and lock acquisition', async () => {
+      // First call (before lock): status is active
+      // Second call (after lock): status became cancelled
+      orderRepository.findOrderById
+        .mockResolvedValueOnce({ data: activeOrder, error: null })
+        .mockResolvedValueOnce({ data: { ...activeOrder, status: 'cancelled' }, error: null });
+
+      await expect(
+        milestoneService.updateMilestone({
+          orderId: 'ord-m1',
+          milestone: 'Goods Loaded',
+          driverId: 'drv-m1',
+        })
+      ).rejects.toMatchObject({
+        status: 409,
+        payload: { error: 'Cannot update milestone: order has been cancelled.' },
+      });
+    });
+
     it('rejects milestone update when cancel lock cannot be acquired (active cancel in progress)', async () => {
       orderRepository.findOrderById.mockResolvedValue({
         data: activeOrder,
         error: null,
       });
 
-      const lockSpy = vi.spyOn(lockModule, 'acquireLockOrFallback').mockResolvedValueOnce({
+      vi.mocked(acquireLockOrFallback).mockResolvedValueOnce({
         ok: false,
         release: vi.fn(),
       });
@@ -278,7 +336,6 @@ describe('Order Cancellation Idempotency & Concurrency Tests (#11242)', () => {
         status: 409,
         payload: { error: 'Order is currently being cancelled or modified. Cannot update milestone.' },
       });
-      lockSpy.mockRestore();
     });
   });
 });

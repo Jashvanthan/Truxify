@@ -452,8 +452,9 @@ contract TruxifyEscrow is ReentrancyGuard, Ownable, Pausable {
 
     function _cancelBookingInternal(uint256 bookingId, bytes32 idempotencyKey) internal {
         if (idempotencyKey != bytes32(0)) {
-            require(!processedCancellations[idempotencyKey], "TruxifyEscrow: Cancellation already processed");
-            processedCancellations[idempotencyKey] = true;
+            bytes32 scopedKey = keccak256(abi.encode(bookingId, idempotencyKey));
+            require(!processedCancellations[scopedKey], "TruxifyEscrow: Cancellation already processed");
+            processedCancellations[scopedKey] = true;
             emit CancellationProcessed(bookingId, idempotencyKey, keccak256(abi.encodePacked(bookingId, idempotencyKey, block.timestamp)));
         }
 
@@ -515,8 +516,9 @@ contract TruxifyEscrow is ReentrancyGuard, Ownable, Pausable {
 
     function _cancelWithPenaltyInternal(uint256 bookingId, uint256 driverFee, bytes32 idempotencyKey) internal {
         if (idempotencyKey != bytes32(0)) {
-            require(!processedCancellations[idempotencyKey], "TruxifyEscrow: Cancellation already processed");
-            processedCancellations[idempotencyKey] = true;
+            bytes32 scopedKey = keccak256(abi.encode(bookingId, idempotencyKey));
+            require(!processedCancellations[scopedKey], "TruxifyEscrow: Cancellation already processed");
+            processedCancellations[scopedKey] = true;
             emit CancellationProcessed(bookingId, idempotencyKey, keccak256(abi.encodePacked(bookingId, driverFee, idempotencyKey, block.timestamp)));
         }
 
