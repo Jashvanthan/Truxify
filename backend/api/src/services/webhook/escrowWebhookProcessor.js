@@ -99,7 +99,9 @@ async function creditDriverWallet(order, txHash) {
   }
   const db = requireDb();
   if (typeof db.rpc !== 'function') {
-    return;
+    throw new Error(
+      `Database client does not support rpc; cannot credit driver wallet for ${order.order_display_id}`
+    );
   }
   const { error } = await db.rpc('complete_trip_tx', {
     p_order_id: order.id,
@@ -542,20 +544,10 @@ async function handleWithdrawalSettled(payload) {
 
   const verification = await verifyPolygonWithdrawalTransaction({ txHash });
 
-  const settlement = isRefund
-    ? { escrow_status: 'refunded', refund_tx_hash: verification.txHash, updated_at: now }
-    : {
-        escrow_status: 'released',
-        release_tx_hash: verification.txHash,
-        escrow_released_at: now,
-        escrow_release_error: null,
-        updated_at: now,
-      };
-
   const updatePayload = {
     escrow_status: isRefund ? 'refunded' : 'released',
-    release_tx_hash: isRefund ? null : (verification.txHash || txHash || order.release_tx_hash || null),
-    refund_tx_hash: isRefund ? (verification.txHash || txHash || order.refund_tx_hash || null) : null,
+    release_tx_hash: isRefund ? (order.release_tx_hash || null) : (verification.txHash || txHash || order.release_tx_hash || null),
+    refund_tx_hash: isRefund ? (verification.txHash || txHash || order.refund_tx_hash || null) : (order.refund_tx_hash || null),
     escrow_released_at: isRefund ? null : now,
     escrow_release_error: null,
     updated_at: now,

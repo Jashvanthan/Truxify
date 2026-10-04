@@ -460,6 +460,11 @@ describe('processEscrowWebhookEvent — WithdrawalReady / Withdrawn', () => {
 
   it('rejects a withdrawal webhook without a well-formed transaction hash (permanent)', async () => {
     dbState.orderResult = { data: makeOrder({ order_display_id: '#OD6' }), error: null };
+    await expect(
+      processEscrowWebhookEvent('WithdrawalReady', { orderId: '#OD6' })
+    ).rejects.toMatchObject({ code: 'INVALID_TX_HASH', retryable: false });
+    expect(verifierMock.verifyWithdrawal).not.toHaveBeenCalled();
+    expect(dbState.updates).toHaveLength(0);
   });
   it('reconciles the wallet ledger exactly once for a duplicate release (no infinite DLQ re-entry, #12154)', async () => {
     // Released-before-reconcile ordering: a release Webhook re-delivered after
@@ -548,7 +553,9 @@ describe('regression: wallet ledger must not multiply the net credit across driv
       ([table]) => table === 'wallet_transactions'
     );
     expect(walletCalls).toHaveLength(1);
-    expect(mockQuery.update).toHaveBeenCalledWith(
+    const walletTxUpdate = dbState.updates.find((u) => u.table === 'wallet_transactions');
+    expect(walletTxUpdate).toBeDefined();
+    expect(walletTxUpdate.payload).toEqual(
       expect.objectContaining({ status: 'confirmed' })
     );
   });
