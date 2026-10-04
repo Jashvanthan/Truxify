@@ -172,6 +172,9 @@ beforeEach(() => {
   resetDbState();
   verifierMock.verifyEscrow.mockResolvedValue({ ok: true, txHash: TX, blockNumber: 195, confirmations: 6 });
   verifierMock.verifyWithdrawal.mockResolvedValue({ ok: true, txHash: TX, blockNumber: 195, confirmations: 6 });
+  process.env.POLYGON_RPC_URL = 'https://polygon-rpc.example';
+  process.env.ESCROW_CONTRACT_ADDRESS = '0xEscrowContract000000000000000000000001';
+  mockGetTransactionReceipt.mockResolvedValue({ status: 1, to: '0xEscrowContract000000000000000000000001', logs: [] });
 });
 
 describe('processEscrowWebhookEvent', () => {

@@ -87,12 +87,14 @@ async function reconcileWalletLedger(order, txHash) {
   return;
 }
 
-// Authoritative driver payout for a verified on-chain release. Runs
-// `complete_trip_tx` (service_role, no OTP) which is idempotent on
-// `status = 'payment_released'`: it increments `driver_details.wallet_confirmed`
-// / `wallet_total` and inserts the confirmed `wallet_transactions` credit row
-// exactly once. The webhook has already verified the Polygon release receipt, so
-// the supplied release hash is trustworthy (issue #14685).
+/**
+ * Credits the driver's wallet by executing the complete_trip_tx database RPC.
+ * Throws an explicit error if the database client lacks RPC support.
+ *
+ * @param {object} order - The order record from the database.
+ * @param {string} [txHash] - On-chain release transaction hash.
+ * @returns {Promise<void>}
+ */
 async function creditDriverWallet(order, txHash) {
   if (!order.driver_id) {
     return;
@@ -192,8 +194,16 @@ function assertEscrowEnabled(order) {
   }
 }
 
-// Mark an order escrow-released after on-chain verification, protecting against
-// the same transaction hash being recorded against a different order (replay).
+/**
+ * Marks an order escrow-released in the database after on-chain verification.
+ * Enforces partial index uniqueness against release_tx_hash replay.
+ *
+ * @param {object} params
+ * @param {object} params.order - Order database entity.
+ * @param {string} params.txHash - Verified transaction hash.
+ * @param {string} params.now - ISO timestamp string.
+ * @returns {Promise<void>}
+ */
 async function releaseOrder({ order, txHash, now }) {
   const db = requireDb();
 
@@ -294,12 +304,15 @@ function extractEscrowEventAmount(receipt, eventType) {
   return matched;
 }
 
-// Asserts the on-chain release/refund transferred exactly the escrowed amount.
-// The amount is taken from the escrow contract's emitted event logs (which
-// carry the actual moved wei) rather than `receipt.value` — the latter is the
-// transaction's `msg.value`, which is `0` for contract-initiated payouts.
-// Binding the decoded amount to the order prevents a misrouted/partial event
-// from triggering a full payout.
+/**
+ * Asserts that the transaction receipt emitted an escrow event whose transferred
+ * wei matches the order's escrow_amount_wei.
+ *
+ * @param {object} receipt - Ethers transaction receipt.
+ * @param {object} order - Order database entity.
+ * @param {string} eventType - Name of the event ('PaymentReleased', 'BookingCancelled', etc.).
+ * @returns {boolean} True if validation succeeds.
+ */
 function assertReceiptAmount(receipt, order, eventType) {
   if (!order.escrow_amount_wei || BigInt(order.escrow_amount_wei) === 0n) {
     return true;
@@ -339,6 +352,14 @@ function assertBookingBinding(payload, order) {
   }
 }
 
+/**
+ * Reconciles an on-chain PaymentReleased webhook event with the order escrow state.
+ * Validates order binding, verifies Polygon receipt and event amount, marks the
+ * order released, credits the driver's wallet, and updates the ledger.
+ *
+ * @param {object} payload - Webhook event payload.
+ * @returns {Promise<void>}
+ */
 async function handlePaymentReleased(payload) {
   if (!payload.orderId) {
     throw new Error('Missing orderId in escrow webhook payload');
@@ -420,10 +441,8 @@ async function handlePaymentReleased(payload) {
 
   assertBookingBinding(payload, order);
 
-  if (process.env.POLYGON_RPC_URL) {
-    const receipt = await verifyPolygonTransactionReceipt(payload.txHash);
-    assertReceiptAmount(receipt, order, 'PaymentReleased');
-  }
+  const receipt = await verifyPolygonTransactionReceipt(payload.txHash);
+  assertReceiptAmount(receipt, order, 'PaymentReleased');
 
   const verification = await verifyPolygonEscrowTransaction({
     txHash,
@@ -438,6 +457,13 @@ async function handlePaymentReleased(payload) {
   logger.info(`[Webhook] Order ${order.order_display_id} marked escrow released (tx: ${payload.txHash})`);
 }
 
+/**
+ * Reconciles an on-chain BookingCancelled webhook event with the order escrow state.
+ * Verifies on-chain cancellation receipt and marks the order as refunded.
+ *
+ * @param {object} payload - Webhook event payload.
+ * @returns {Promise<void>}
+ */
 async function handleBookingCancelled(payload) {
   const order = await findOrderByIdOrDisplayId(payload.orderId);
   const now = new Date().toISOString();
@@ -461,7 +487,7 @@ async function handleBookingCancelled(payload) {
   // Like a payout, a contract-initiated cancel has msg.value === 0, so the
   // released/refunded wei is read from the BookingCancelled /
   // CancellationPenaltyApplied event logs rather than receipt.value.
-  if (payload.txHash && process.env.POLYGON_RPC_URL) {
+  if (payload.txHash) {
     const receipt = await verifyPolygonTransactionReceipt(payload.txHash);
     assertReceiptAmount(receipt, order, 'BookingCancelled');
   }
@@ -491,9 +517,14 @@ async function handleBookingCancelled(payload) {
   logger.info(`[Webhook] Order ${order.order_display_id} marked escrow refunded (tx: ${payload.txHash})`);
 }
 
-// WithdrawalReady / Withdrawn: the escrowed funds were settled via the
-// pull-based withdrawal path (e.g. a driver's direct withdraw()). Reconcile
-// the order based on its current escrow state.
+/**
+ * Reconciles pull-based withdrawal settlement events (WithdrawalReady / Withdrawn).
+ * Reconciles the order based on its current escrow state (refund vs release)
+ * and updates order and ledger records.
+ *
+ * @param {object} payload - Webhook event payload.
+ * @returns {Promise<void>}
+ */
 async function handleWithdrawalSettled(payload) {
   const order = await findOrderByIdOrDisplayId(payload.orderId);
   const now = new Date().toISOString();
