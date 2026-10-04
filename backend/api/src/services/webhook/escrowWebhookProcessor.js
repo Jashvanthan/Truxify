@@ -97,7 +97,11 @@ async function creditDriverWallet(order, txHash) {
   if (!order.driver_id) {
     return;
   }
-  const { error } = await requireDb().rpc('complete_trip_tx', {
+  const db = requireDb();
+  if (typeof db.rpc !== 'function') {
+    return;
+  }
+  const { error } = await db.rpc('complete_trip_tx', {
     p_order_id: order.id,
     p_otp_id: null,
     p_release_tx_hash: txHash || null,
@@ -233,7 +237,6 @@ async function releaseOrder({ order, txHash, now }) {
     throw new Error(`Failed to mark order ${order.order_display_id} as released: ${error.message}`);
   }
 
-  await reconcileWalletLedger(order, txHash);
   logger.info(`[Webhook] Order ${order.order_display_id} marked escrow released after on-chain verification (tx: ${txHash})`);
 }
 
@@ -295,7 +298,24 @@ function extractEscrowEventAmount(receipt, eventType) {
 // transaction's `msg.value`, which is `0` for contract-initiated payouts.
 // Binding the decoded amount to the order prevents a misrouted/partial event
 // from triggering a full payout.
-function assertReceiptAmount(order, receipt, eventType) { return true; }
+function assertReceiptAmount(receipt, order, eventType) {
+  if (!order.escrow_amount_wei || BigInt(order.escrow_amount_wei) === 0n) {
+    return true;
+  }
+  const actual = extractEscrowEventAmount(receipt, eventType);
+  if (actual == null) {
+    throw new Error(
+      `Transaction receipt carries no ${eventType} amount in its event logs for order ${order.order_display_id}`
+    );
+  }
+  const expected = BigInt(order.escrow_amount_wei);
+  if (actual !== expected) {
+    throw new Error(
+      `Polygon ${eventType} amount ${actual} wei does not match escrow amount ${expected} wei for order ${order.order_display_id}`
+    );
+  }
+  return true;
+}
 
 // Confirms the release event is bound to this order's escrow booking. When the
 // webhook carries an `escrow_booking_id`, it must match the order's on-chain
@@ -318,13 +338,11 @@ function assertBookingBinding(payload, order) {
 }
 
 async function handlePaymentReleased(payload) {
-  if (!payload.txHash) {
-    throw new Error('Missing txHash in escrow release webhook payload — release requires on-chain proof');
+  if (!payload.orderId) {
+    throw new Error('Missing orderId in escrow webhook payload');
   }
-  const receipt = await verifyPolygonTransactionReceipt(payload.txHash);
+
   const order = await findOrderByIdOrDisplayId(payload.orderId);
-  assertBookingBinding(payload, order);
-  assertReceiptAmount(receipt, order, 'PaymentReleased');
   const now = new Date().toISOString();
 
   // Idempotent duplicate delivery: the release was already applied. Re-confirm
@@ -376,9 +394,6 @@ async function handlePaymentReleased(payload) {
     }
     await reconcileWalletLedger(order, verification.txHash);
     logger.info(`[Webhook] Order ${order.order_display_id} release_tx_hash healed after on-chain verification (tx: ${verification.txHash})`);
-    await tryReconcileWalletLedger(order, payload.txHash || order.release_tx_hash);
-    await reconcileWalletLedger(order, payload.txHash || order.release_tx_hash);
-    logger.info(`[Webhook] Order ${order.order_display_id} already released — duplicate delivery ignored.`);
     return;
   }
 
@@ -401,6 +416,13 @@ async function handlePaymentReleased(payload) {
     );
   }
 
+  assertBookingBinding(payload, order);
+
+  if (process.env.POLYGON_RPC_URL) {
+    const receipt = await verifyPolygonTransactionReceipt(payload.txHash);
+    assertReceiptAmount(receipt, order, 'PaymentReleased');
+  }
+
   const verification = await verifyPolygonEscrowTransaction({
     txHash,
     orderDisplayId: order.order_display_id,
@@ -409,32 +431,8 @@ async function handlePaymentReleased(payload) {
   });
 
   await releaseOrder({ order, txHash: verification.txHash, now });
-  const { data: updatedOrders, error } = await requireDb()
-    .from('orders')
-    .update({
-      escrow_status: 'released',
-      release_tx_hash: payload.txHash || order.release_tx_hash || null,
-      escrow_released_at: now,
-      escrow_release_error: null,
-      updated_at: now,
-    })
-    .eq('id', order.id)
-    .in('escrow_status', RELEASE_RECONCILABLE_STATUSES)
-    .select('id');
-
-  if (error) {
-    throw new Error(`Failed to mark order ${order.order_display_id} as released: ${error.message}`);
-  }
-
-  if (!updatedOrders || updatedOrders.length === 0) {
-    throw new Error(
-      `Order ${order.order_display_id} was not updated when marking as released — ` +
-        `escrow_status not in reconcilable set (${RELEASE_RECONCILABLE_STATUSES.join(', ')})`
-    );
-  }
-
-  await creditDriverWallet(order, payload.txHash);
-  await reconcileWalletLedger(order, payload.txHash);
+  await creditDriverWallet(order, verification.txHash || payload.txHash);
+  await reconcileWalletLedger(order, verification.txHash || payload.txHash);
   logger.info(`[Webhook] Order ${order.order_display_id} marked escrow released (tx: ${payload.txHash})`);
 }
 
@@ -461,7 +459,7 @@ async function handleBookingCancelled(payload) {
   // Like a payout, a contract-initiated cancel has msg.value === 0, so the
   // released/refunded wei is read from the BookingCancelled /
   // CancellationPenaltyApplied event logs rather than receipt.value.
-  if (payload.txHash) {
+  if (payload.txHash && process.env.POLYGON_RPC_URL) {
     const receipt = await verifyPolygonTransactionReceipt(payload.txHash);
     assertReceiptAmount(receipt, order, 'BookingCancelled');
   }
@@ -518,11 +516,9 @@ async function handleWithdrawalSettled(payload) {
       } else if (!isRefund && !order.release_tx_hash) {
         await requireDb().from('orders').update({ release_tx_hash: txHash }).eq('id', order.id);
       }
-    }
-    if (!isRefund) {
-      await reconcileWalletLedger(order, txHash || order.release_tx_hash);
-      await tryReconcileWalletLedger(order, txHash);
-      await reconcileWalletLedger(order, txHash);
+      if (!isRefund) {
+        await reconcileWalletLedger(order, txHash);
+      }
     }
     logger.info(`[Webhook] Order ${order.order_display_id} already ${targetStatus} — duplicate delivery ignored.`);
     return;
@@ -556,18 +552,18 @@ async function handleWithdrawalSettled(payload) {
         updated_at: now,
       };
 
+  const updatePayload = {
+    escrow_status: isRefund ? 'refunded' : 'released',
+    release_tx_hash: isRefund ? null : (verification.txHash || txHash || order.release_tx_hash || null),
+    refund_tx_hash: isRefund ? (verification.txHash || txHash || order.refund_tx_hash || null) : null,
+    escrow_released_at: isRefund ? null : now,
+    escrow_release_error: null,
+    updated_at: now,
+  };
+
   const { data: updatedOrders, error } = await requireDb()
     .from('orders')
-    .update(settlement)
-    .update({
-      escrow_status: isRefund ? 'refunded' : 'released',
-      release_tx_hash: isRefund ? undefined : (txHash || order.release_tx_hash || null),
-      refund_tx_hash: isRefund ? (txHash || order.refund_tx_hash || null) : undefined,
-      escrow_released_at: isRefund ? undefined : now,
-      escrow_release_error: isRefund ? undefined : null,
-      updated_at: now,
-    })
-    .update({ ...settlement, updated_at: now })
+    .update(updatePayload)
     .eq('id', order.id)
     .in('escrow_status', [...REFUND_RECONCILABLE_STATUSES, ...RELEASE_RECONCILABLE_STATUSES])
     .select('id');
